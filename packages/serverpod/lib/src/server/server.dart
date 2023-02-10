@@ -175,7 +175,10 @@ class Server {
       await request.response.close();
       return;
     } else if (uri.path == '/websocket') {
-      var webSocket = await WebSocketTransformer.upgrade(request);
+      var webSocket = await WebSocketTransformer.upgrade(
+        request,
+        compression: CompressionOptions.compressionOff,
+      );
       webSocket.pingInterval = const Duration(seconds: 30);
       unawaited(_handleWebsocket(webSocket, request));
       return;
@@ -294,8 +297,12 @@ class Server {
     WebSocket webSocket,
     HttpRequest request,
   ) async {
+    StreamingSession? session;
+    Object? sessionError;
+    StackTrace? sessionStackTrace;
+
     try {
-      var session = StreamingSession(
+      session = StreamingSession(
         server: this,
         uri: request.uri,
         httpRequest: request,
@@ -313,100 +320,29 @@ class Server {
         }
       }
 
-      dynamic error;
-      StackTrace? stackTrace;
+      StreamSubscription? webSocketSubscription;
 
       try {
-        await for (String jsonData in webSocket) {
-          var data = jsonDecode(jsonData) as Map;
+        webSocketSubscription = webSocket.listen(
+          (data) => _onWebSocketMessage(
+            session: session!,
+            jsonData: data as String?,
+            webSocket: webSocket,
+          ),
+          onDone: () {
+            unawaited(webSocketSubscription?.cancel());
+            webSocketSubscription = null;
+          },
+          cancelOnError: true,
+        );
 
-          // Handle control commands.
-          var command = data['command'] as String?;
-          if (command != null) {
-            var args = data['args'] as Map;
-
-            if (command == 'ping') {
-              webSocket.add(jsonEncode({'command': 'pong'}));
-            } else if (command == 'auth') {
-              var authKey = args['key'] as String?;
-              session.updateAuthenticationKey(authKey);
-            }
-            continue;
-          }
-
-          // Handle messages passed to endpoints.
-          var endpointName = data['endpoint'] as String;
-          var serialization = data['object'] as Map;
-          var message = serializationManager.createEntityFromSerialization(
-              serialization.cast<String, dynamic>());
-
-          if (message == null) throw Exception('Streamed message was null');
-
-          var endpointConnector = endpoints.getConnectorByName(endpointName);
-          if (endpointConnector == null) {
-            throw Exception('Endpoint not found: $endpointName');
-          }
-
-          var authFailed = await endpoints.canUserAccessEndpoint(
-              session, endpointConnector.endpoint);
-
-          if (authFailed == null) {
-            // Process the message.
-            var startTime = DateTime.now();
-            dynamic messageError;
-            StackTrace? messageStackTrace;
-
-            try {
-              session.sessionLogs.currentEndpoint = endpointName;
-              await endpointConnector.endpoint
-                  .handleStreamMessage(session, message);
-            } catch (e, s) {
-              messageError = e;
-              messageStackTrace = s;
-            }
-
-            var duration =
-                DateTime.now().difference(startTime).inMicroseconds / 1000000.0;
-            var logManager = session.serverpod.logManager;
-
-            var slow = duration >=
-                logManager
-                    .getLogSettingsForStreamingSession(
-                      endpoint: endpointName,
-                    )
-                    .slowSessionDuration;
-
-            var shouldLog = logManager.shouldLogMessage(
-              session: session,
-              endpoint: endpointName,
-              slow: slow,
-              failed: messageError != null,
-            );
-
-            if (shouldLog) {
-              var logEntry = MessageLogEntry(
-                sessionLogId: session.sessionLogs.temporarySessionId,
-                serverId: serverId,
-                messageId: session.currentMessageId,
-                endpoint: endpointName,
-                messageName: message.className,
-                duration: duration,
-                order: session.sessionLogs.currentLogOrderId,
-                error: messageError?.toString(),
-                stackTrace: messageStackTrace?.toString(),
-                slow: slow,
-              );
-              unawaited(logManager.logMessage(session, logEntry));
-
-              session.sessionLogs.currentLogOrderId += 1;
-            }
-
-            session.currentMessageId += 1;
-          }
-        }
-      } catch (e, s) {
-        error = e;
-        stackTrace = s;
+        await webSocketSubscription?.asFuture();
+      } catch (error, stackTrace) {
+        sessionError = error;
+        sessionStackTrace = stackTrace;
+      } finally {
+        unawaited(webSocketSubscription?.cancel());
+        webSocketSubscription = null;
       }
 
       // TODO: Possibly keep a list of open streams instead
@@ -418,11 +354,106 @@ class Server {
           await _callStreamClosed(session, endpointConnector.endpoint);
         }
       }
-      await session.close(error: error, stackTrace: stackTrace);
-    } catch (e, stackTrace) {
-      stderr.writeln('$e');
+    } catch (error, stackTrace) {
+      stderr.writeln('$error');
       stderr.writeln('$stackTrace');
+    } finally {
+      if (session != null) {
+        await session.close(error: sessionError, stackTrace: sessionStackTrace);
+      }
+    }
+  }
+
+  Future<void> _onWebSocketMessage({
+    required StreamingSession session,
+    required WebSocket webSocket,
+    required String? jsonData,
+  }) async {
+    if (jsonData == null) return;
+
+    var data = jsonDecode(jsonData) as Map;
+
+    // Handle control commands.
+    var command = data['command'] as String?;
+    if (command != null) {
+      var args = data['args'] as Map;
+
+      if (command == 'ping') {
+        webSocket.add(jsonEncode({'command': 'pong'}));
+      } else if (command == 'auth') {
+        var authKey = args['key'] as String?;
+        session.updateAuthenticationKey(authKey);
+      }
       return;
+    }
+
+    // Handle messages passed to endpoints.
+    var endpointName = data['endpoint'] as String;
+    var serialization = data['object'] as Map;
+    var message = serializationManager
+        .createEntityFromSerialization(serialization.cast<String, dynamic>());
+
+    if (message == null) throw Exception('Streamed message was null');
+
+    var endpointConnector = endpoints.getConnectorByName(endpointName);
+    if (endpointConnector == null) {
+      throw Exception('Endpoint not found: $endpointName');
+    }
+
+    var authFailed = await endpoints.canUserAccessEndpoint(
+        session, endpointConnector.endpoint);
+
+    if (authFailed == null) {
+      // Process the message.
+      var startTime = DateTime.now();
+      dynamic messageError;
+      StackTrace? messageStackTrace;
+
+      try {
+        session.sessionLogs.currentEndpoint = endpointName;
+        await endpointConnector.endpoint.handleStreamMessage(session, message);
+      } catch (e, s) {
+        messageError = e;
+        messageStackTrace = s;
+      }
+
+      var duration =
+          DateTime.now().difference(startTime).inMicroseconds / 1000000.0;
+      var logManager = session.serverpod.logManager;
+
+      var slow = duration >=
+          logManager
+              .getLogSettingsForStreamingSession(
+                endpoint: endpointName,
+              )
+              .slowSessionDuration;
+
+      var shouldLog = logManager.shouldLogMessage(
+        session: session,
+        endpoint: endpointName,
+        slow: slow,
+        failed: messageError != null,
+      );
+
+      if (shouldLog) {
+        var logEntry = MessageLogEntry(
+          sessionLogId: session.sessionLogs.temporarySessionId,
+          serverId: serverId,
+          messageId: session.currentMessageId,
+          endpoint: endpointName,
+          messageName: message.className,
+          duration: duration,
+          order: session.sessionLogs.currentLogOrderId,
+          error: messageError?.toString(),
+          stackTrace: messageStackTrace?.toString(),
+          slow: slow,
+        );
+        unawaited(logManager.logMessage(session, logEntry));
+
+        session.sessionLogs.currentLogOrderId += 1;
+      }
+
+      session.currentMessageId += 1;
     }
   }
 
